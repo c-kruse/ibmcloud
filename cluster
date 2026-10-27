@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# != 2 ]] || [[ ! $1 =~ ^(init|plan|apply|output|state-list)$ ]]; then
+  echo "Usage: $0 {init|plan|apply|output|state-list} <cluster.tfvars>" >&2
+  exit 2
+fi
+
+action=$1
+vars=$(realpath "$2")
+root=$(dirname "$(realpath "$0")")
+[[ -f $vars ]] || { echo "Missing inputs: $vars" >&2; exit 1; }
+[[ -f $root/backend.hcl ]] || {
+  echo "Missing tracked file $root/backend.hcl. Restore it from Git; see state-storage/README.md for access requirements." >&2
+  exit 1
+}
+
+# Credentials stay in this process, never printed or written to a config file.
+# Explicit provider API keys and complete HMAC credentials still work for CI.
+set +x
+if [[ $action =~ ^(plan|apply)$ && -z ${IBMCLOUD_API_KEY:-}${IC_API_KEY:-} ]]; then
+  if ! iam_token=$(ibmcloud iam oauth-tokens --output JSON | jq -er '.iam_token | select(type == "string" and length > 0)'); then
+    echo "IBM Cloud login unavailable. Run 'ibmcloud login --sso' and retry." >&2
+    exit 1
+  fi
+  iam_refresh_token=$(jq -er '.IAMRefreshToken | select(type == "string" and length > 0)' \
+    "${IBMCLOUD_HOME:-$HOME/.bluemix}/config.json")
+  export IC_IAM_TOKEN="$iam_token" IC_IAM_REFRESH_TOKEN="$iam_refresh_token"
+  unset iam_token iam_refresh_token
+fi
+
+if [[ -z ${AWS_ACCESS_KEY_ID:-} || -z ${AWS_SECRET_ACCESS_KEY:-} ]]; then
+  cos_hmac=$(ibmcloud resource service-key skupper-tfstate-experiment --output JSON |
+    jq -ec '(if type == "array" then .[0] else . end).credentials.cos_hmac_keys')
+  access_key=$(jq -er '.access_key_id | select(type == "string" and length > 0)' <<< "$cos_hmac")
+  secret_key=$(jq -er '.secret_access_key | select(type == "string" and length > 0)' <<< "$cos_hmac")
+  unset AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE
+  export AWS_ACCESS_KEY_ID="$access_key" AWS_SECRET_ACCESS_KEY="$secret_key"
+  unset cos_hmac access_key secret_key
+fi
+
+# Read and validate HCL through Terraform, without initializing a backend or
+# accessing remote state. This avoids a second HCL parser/dependency.
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+cp "$root/variables.tf" "$scratch/variables.tf"
+export TF_WORKSPACE=default
+cluster_name=$(
+  unset TF_DATA_DIR
+  terraform -chdir="$scratch" console -var-file="$vars" <<< 'var.cluster_name' | jq -er .
+)
+[[ $cluster_name =~ ^[a-z][a-z0-9-]{0,39}$ ]] || { echo "Invalid cluster name." >&2; exit 1; }
+
+key="clusters/v1.0/$cluster_name.tfstate"
+export TF_DATA_DIR="$root/.terraform/clusters/$cluster_name"
+mkdir -p "$TF_DATA_DIR"
+plan="$TF_DATA_DIR/cluster.tfplan"
+
+printf 'Cluster: %s\nState key: %s\n' "$cluster_name" "$key"
+terraform -chdir="$root" init -input=false -reconfigure \
+  -backend-config="$root/backend.hcl" -backend-config="key=$key"
+
+case "$action" in
+  init) ;;
+  plan)
+    # Remove an old plan so a failed new plan cannot leave it available to apply.
+    rm -f "$plan" "$plan.inputs.sha256"
+    terraform -chdir="$root" plan -input=false -var-file="$vars" \
+      -var="cluster_name=$cluster_name" -out="$plan"
+    sha256sum < "$vars" > "$plan.inputs.sha256"
+    ;;
+  apply)
+    [[ -f $plan && -f $plan.inputs.sha256 ]] || { echo "Run '$0 plan $2' first." >&2; exit 1; }
+    [[ $(sha256sum < "$vars") == "$(cat "$plan.inputs.sha256")" ]] || {
+      echo "Inputs changed since planning; generate a new plan first." >&2; exit 1;
+    }
+    if ! terraform -chdir="$root" show -json "$plan" |
+      jq -e --arg name "$cluster_name" '.variables.cluster_name.value == $name' >/dev/null; then
+      echo "Saved plan does not belong to $cluster_name; generate a new plan." >&2
+      exit 1
+    fi
+    read -r -p "Apply the saved plan? Type $cluster_name to confirm: " answer
+    [[ $answer == "$cluster_name" ]] || { echo "Cancelled." >&2; exit 1; }
+    terraform -chdir="$root" apply -input=false "$plan"
+    rm -f "$plan" "$plan.inputs.sha256"
+    ;;
+  output) terraform -chdir="$root" output ;;
+  state-list) terraform -chdir="$root" state list ;;
+esac

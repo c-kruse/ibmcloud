@@ -1,0 +1,13 @@
+# Copy to clusters/<cluster-name>.tfvars and choose a unique NEW cluster name.
+cluster_name = "our-cluster-2026-2"
+
+region              = "us-east"
+zone                = "us-east-1"
+resource_group_name = "Default"
+openshift_version   = "4.22_openshift"
+worker_flavor       = "bx2.4x16"
+worker_count        = 3
+
+worker_subnet_cidr  = "10.243.0.0/24"
+pod_subnet_cidr     = "172.17.0.0/18"
+service_subnet_cidr = "172.21.0.0/16"

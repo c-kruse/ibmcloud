@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: skupper
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: skupper-updater
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: skupper-updater
+  namespace: skupper-updater
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: skupper-updater
+rules:
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    verbs: [get, list, watch, create, patch, update]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles, clusterrolebindings]
+    verbs: [create]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    resourceNames: [skupper-controller]
+    verbs: [get, patch, update, bind, escalate]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterrolebindings]
+    resourceNames: [skupper-controller]
+    verbs: [get, patch, update]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: skupper-updater
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: skupper-updater
+subjects:
+  - kind: ServiceAccount
+    name: skupper-updater
+    namespace: skupper-updater
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: skupper-updater
+  namespace: skupper
+rules:
+  - apiGroups: [""]
+    resources: [serviceaccounts]
+    verbs: [get, create, patch, update]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: skupper-updater
+  namespace: skupper
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: skupper-updater
+subjects:
+  - kind: ServiceAccount
+    name: skupper-updater
+    namespace: skupper-updater
