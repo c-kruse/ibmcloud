@@ -3,19 +3,26 @@
 Manage two existing OpenShift clusters in **RedHat APE Skupper Dev**
 (`241b9a47dd0848c1a38d8948255f3a1f`), region **us-east**, resource group **Default**.
 
-| Cluster | Terraform inputs | Installed Skupper updater |
+| Cluster | Terraform inputs | Skupper status |
 | --- | --- | --- |
-| `lts-2-2` | [`clusters/lts-2-2.tfvars`](clusters/lts-2-2.tfvars) | Latest stable `2.2.x`, daily at 06:00 UTC |
-| `v2-dev` | [`clusters/v2-dev.tfvars`](clusters/v2-dev.tfvars) | Published development bundle, every 30 minutes |
+| `lts-2-2` | [`clusters/lts-2-2.tfvars`](clusters/lts-2-2.tfvars) | Installed through Tekton; stable `2.2.x` (initially 2.2.4), digest-pinned |
+| `v2-dev` | [`clusters/v2-dev.tfvars`](clusters/v2-dev.tfvars) | Installed through Tekton; published development bundle, digest-pinned |
 
-These deployments and updaters were installed on October 27, 2026; inspect live
-status rather than treating this inventory as a health check. Terraform manages
-infrastructure; the Skupper updater is installed separately with Kubernetes manifests.
+The OpenShift clusters were provisioned on October 27, 2026. On October 29, the
+legacy Skupper controllers, site networks, CRDs, and CronJob updaters were purged
+from both clusters for a clean transition to Tekton. The `skupper`,
+`skupper-updater`, `ck-east`, and `ck-west` namespaces were removed, including
+their certificates and link credentials. Infrastructure and its Terraform state
+were preserved. Inspect live status rather than treating this inventory as a
+health check. The [Pipelines platform setup](platform/README.md) is installed
+on both clusters (Operator 1.24.2), with separate per-cluster state.
+Skupper installation/upgrade and upstream CI test pipelines are implemented on
+both; see the platform guide for validation results, schedules, permissions and run history.
 
 **Choose your task (all commands run from the repository root):**
 
 - **[Connect to a cluster](#connect-to-a-cluster):** no Terraform or state credentials needed.
-- **[Inspect Skupper](skupper-updater/README.md#inspect-the-installed-updater):** schedules, Jobs, logs, and installed images.
+- **[Set up OpenShift Pipelines](platform/README.md):** Terraform-managed Operator bootstrap, CI platform, Skupper upgrade and E2E test pipelines.
 - **[Manage existing infrastructure](#manage-existing-infrastructure):** configure backend access, inspect state, plan, then review before applying.
 - **[Create another deployment](#create-another-deployment):** choose a new name and non-overlapping networks; reuse the existing state bucket.
 - **[Bootstrap storage](state-storage/README.md#bootstrap-new-storage):** only for a new environment, not a fresh checkout of these deployments.
@@ -188,8 +195,10 @@ not bootstrap another state bucket. Copy `terraform.tfvars.example` to
 `clusters/<new-cluster-name>.tfvars`, choose a unique stable `cluster_name` and
 non-overlapping worker, pod, and service ranges, then use `./cluster plan` and
 `./cluster apply` with that file. Review the full plan and budget first.
-Terraform creates infrastructure only; install a matching Skupper updater
-separately using the [bootstrap guide](skupper-updater/README.md#publish-and-bootstrap-changes-the-selected-cluster).
+The infrastructure Terraform does not install Skupper. Prepare a matching
+platform inputs file and follow the [Pipelines setup guide](platform/README.md)
+for the separate CI platform. Review the release policy, pin a runner image,
+and validate a full run before enabling schedules on another cluster.
 
 For a different account or a new storage environment, first follow
 [Bootstrap new storage](state-storage/README.md#bootstrap-new-storage).
@@ -211,8 +220,10 @@ Networking uses IBM's default VPC ACL/security group and the managed cluster's
 secure-by-default configuration, with public API access and outbound traffic enabled.
 
 Terraform does **not** install Skupper, Network Observer, demo applications,
-user workload monitoring, or application routes. For the separate Skupper
-installation and automatic upgrades, see the [updater guide](skupper-updater/README.md).
+user workload monitoring, or application routes. The separate
+[platform Terraform](platform/README.md) prepares OpenShift Pipelines and its
+Skupper installation/testing workflows. PipelineRuns, not Terraform, own the
+installed Skupper release. The legacy CronJob updater has been retired and removed.
 
 ## Operational notes
 

@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# != 3 || ! $1 =~ ^(bootstrap|configuration)$ || ! $2 =~ ^(init|plan|apply|output|state-list|wait)$ || ! $3 =~ ^[a-z][a-z0-9-]{0,39}$ ]]; then
+  echo "Usage: $0 {bootstrap|configuration} {init|plan|apply|output|state-list|wait} CLUSTER" >&2
+  exit 2
+fi
+stage=$1 action=$2 cluster=$3
+root=$(dirname "$(realpath "$0")")
+repo=$(dirname "$root")
+vars="$root/clusters/$cluster.tfvars"
+[[ -f $vars ]] || { echo "Missing inputs: $vars" >&2; exit 1; }
+
+# Parse HCL without a backend or provider initialization.
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+cat > "$scratch/variables.tf" <<'EOF'
+variable "cluster_name" { type = string }
+variable "kube_context" { type = string }
+variable "kubeconfig_path" { default = "~/.kube/config" }
+EOF
+export TF_WORKSPACE=default
+settings=$(
+  unset TF_DATA_DIR
+  terraform -chdir="$scratch" console -var-file="$vars" <<<'jsonencode({name=var.cluster_name, context=var.kube_context, path=pathexpand(var.kubeconfig_path)})' | jq -er .
+)
+[[ $(jq -r .name <<< "$settings") == "$cluster" ]] || { echo "Cluster name does not match inputs filename." >&2; exit 1; }
+context=$(jq -er '.context | select(length > 0)' <<< "$settings")
+kubeconfig=$(jq -er .path <<< "$settings")
+kube=(kubectl --kubeconfig "$kubeconfig" --context "$context" --request-timeout=30s)
+
+if [[ $action == wait ]]; then
+  "${kube[@]}" wait --for=create crd/tektonconfigs.operator.tekton.dev --timeout=10m
+  "${kube[@]}" wait --for=condition=Established crd/tektonconfigs.operator.tekton.dev --timeout=10m
+  "${kube[@]}" wait --for=create tektonconfig/config --timeout=10m
+  "${kube[@]}" wait --for=condition=Ready tektonconfig/config --timeout=20m
+  "${kube[@]}" wait --for=condition=Established crd/pipelines.tekton.dev crd/pipelineruns.tekton.dev --timeout=10m
+  exit
+fi
+
+export TF_DATA_DIR="$repo/.terraform/platform/$cluster/$stage"
+mkdir -p "$TF_DATA_DIR"
+plan="$TF_DATA_DIR/platform.tfplan"
+if [[ $action == plan ]]; then
+  rm -f "$plan" "$plan.sha256"
+fi
+
+set +x
+if [[ -z ${AWS_ACCESS_KEY_ID:-} || -z ${AWS_SECRET_ACCESS_KEY:-} ]]; then
+  credentials=$(ibmcloud resource service-key skupper-tfstate-experiment --output JSON |
+    jq -ec '(if type == "array" then .[0] else . end).credentials.cos_hmac_keys')
+  export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+  AWS_ACCESS_KEY_ID=$(jq -er '.access_key_id | select(length > 0)' <<< "$credentials")
+  AWS_SECRET_ACCESS_KEY=$(jq -er '.secret_access_key | select(length > 0)' <<< "$credentials")
+  unset AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE
+  unset credentials
+fi
+
+key="platform/v1.0/$cluster/$stage.tfstate"
+printf 'Cluster: %s\nContext: %s\nStage: %s\nState key: %s\n' "$cluster" "$context" "$stage" "$key"
+terraform -chdir="$root/$stage" init -input=false -reconfigure \
+  -backend-config="$repo/backend.hcl" -backend-config="key=$key"
+
+# Bind reviewed plans to configuration AND the actual cluster, not merely a
+# mutable kubeconfig alias. Never store the kubeconfig or its credentials.
+fingerprint() {
+  {
+    cat "$vars" "$repo/backend.hcl" "$root/$stage/"*.tf "$root/$stage/.terraform.lock.hcl" || return
+    if [[ $stage == configuration ]]; then
+      sha256sum "$root/$stage/Dockerfile" "$root/$stage/scripts/"*.py || return
+    fi
+    "${kube[@]}" get namespace kube-system -o jsonpath='{.metadata.uid}'
+  } | sha256sum
+}
+
+case "$action" in
+  init) ;;
+  plan)
+    digest=$(fingerprint)
+    if [[ $stage == configuration ]]; then
+      "${kube[@]}" wait --for=condition=Ready tektonconfig/config --timeout=30s
+    fi
+    terraform -chdir="$root/$stage" plan -input=false -var-file="$vars" -out="$plan"
+    printf '%s\n' "$digest" > "$plan.sha256"
+    ;;
+  apply)
+    [[ -f $plan && -f $plan.sha256 ]] || { echo "Plan this stage first." >&2; exit 1; }
+    [[ $(fingerprint) == "$(cat "$plan.sha256")" ]] || { echo "Configuration or cluster identity changed; replan." >&2; exit 1; }
+    terraform -chdir="$root/$stage" show -json "$plan" |
+      jq -e --arg cluster "$cluster" --arg context "$context" \
+        '.variables.cluster_name.value == $cluster and .variables.kube_context.value == $context' >/dev/null
+    read -r -p "Apply $stage? Type $cluster to confirm: " answer
+    [[ $answer == "$cluster" ]] || { echo "Cancelled." >&2; exit 1; }
+    terraform -chdir="$root/$stage" apply -input=false "$plan"
+    rm -f "$plan" "$plan.sha256"
+    ;;
+  output) terraform -chdir="$root/$stage" output ;;
+  state-list) terraform -chdir="$root/$stage" state list ;;
+esac
