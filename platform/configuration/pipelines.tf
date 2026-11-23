@@ -1,3 +1,19 @@
+variable "runner_digest" {
+  description = "Runner image digest discovered in the target cluster by platform/manage."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.runner_digest == "" || can(regex("^sha256:[0-9a-f]{64}$", var.runner_digest))
+    error_message = "Use an empty digest for setup or a complete sha256 image digest."
+  }
+}
+
+variable "schedules_suspended" {
+  description = "Keep schedules paused during installation and validation."
+  type        = bool
+  default     = false
+}
+
 locals {
   policies = {
     v2-dev = {
@@ -5,14 +21,12 @@ locals {
       test_revision       = "3981c91c56aabcd603b5b2673252097bee570c4e"
       upgrade_schedule    = "*/30 * * * *"
       schedules_suspended = false
-      runner_digest       = "sha256:a527cb69fc0d40fd26cfb877c23c69984057fc8536f5387b5b1c2fa34a32fb06"
     }
     lts-2-2 = {
       track               = "lts-2-2"
       test_revision       = "3153d06e2cff668a7c9fbc751857591320dcee13"
       upgrade_schedule    = "0 4 * * *"
       schedules_suspended = false
-      runner_digest       = "sha256:4bc2092d18322c42c54a7b2111b8d788e080bc43a5306c876a7463dd3f0911a3"
     }
   }
   ci_enabled = contains(keys(local.policies), var.cluster_name)
@@ -24,9 +38,8 @@ locals {
   ] : [])
   scripts    = { for f in fileset(path.module, "scripts/*.py") : basename(f) => file("${path.module}/${f}") }
   runner_tag = substr(filesha256("${path.module}/Dockerfile"), 0, 16)
-  # Pin the successful in-cluster build. Rebuilding the Dockerfile requires
-  # reviewing and updating this digest before runners consume the new image.
-  runner_image = "image-registry.openshift-image-registry.svc:5000/skupper-ci/runner${local.policy.runner_digest != "" ? "@${local.policy.runner_digest}" : ":${local.runner_tag}"}"
+  # Installation discovers the successful build's digest in this cluster.
+  runner_image = "image-registry.openshift-image-registry.svc:5000/skupper-ci/runner${var.runner_digest != "" ? "@${var.runner_digest}" : ":${local.runner_tag}"}"
   task_spec = {
     metadata   = {}
     spec       = null
@@ -432,7 +445,7 @@ resource "kubernetes_manifest" "schedule" {
     apiVersion = "batch/v1", kind = "CronJob"
     metadata   = { name = "skupper-${each.key}", namespace = "skupper-ci" }
     spec = {
-      schedule                   = each.value, timeZone = "Etc/UTC", suspend = local.policy.schedules_suspended || local.policy.runner_digest == ""
+      schedule                   = each.value, timeZone = "Etc/UTC", suspend = local.policy.schedules_suspended || var.schedules_suspended || var.runner_digest == ""
       concurrencyPolicy          = "Forbid", startingDeadlineSeconds = 300
       successfulJobsHistoryLimit = 2, failedJobsHistoryLimit = 2
       jobTemplate = { spec = {

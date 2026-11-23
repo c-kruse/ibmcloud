@@ -92,9 +92,9 @@ repository. See [IBM's OpenShift access instructions](https://cloud.ibm.com/docs
   and the IBM Cloud CLI. On macOS, install the GNU utilities and ensure these
   command names are on `PATH`.
 - `./cluster` uses the CLI login to retrieve shared state HMAC credentials and,
-  for `plan`/`apply`, provider IAM tokens. Alternatively supply HMAC keys as
+  for `plan`/`apply`/`destroy`, provider IAM tokens. Alternatively supply HMAC keys as
   `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; `init`, `output`, and `state-list`
-  need no provider credentials or CLI login in that case. For `plan`/`apply`,
+  need no provider credentials or CLI login in that case. For `plan`/`apply`/`destroy`,
   an explicit `IBMCLOUD_API_KEY` (or `IC_API_KEY`) replaces CLI provider login.
 - IAM permissions for the resource group, VPC infrastructure, Kubernetes /
   OpenShift service, and Cloud Object Storage, plus the account's required
@@ -188,6 +188,25 @@ follow [Connect to a cluster](#connect-to-a-cluster).
 Use `./cluster state-list clusters/lts-2-2.tfvars` to inspect that cluster's resources, or
 `./cluster init clusters/lts-2-2.tfvars` to initialize its backend without planning.
 
+### Destroy a cluster (permanently deletes infrastructure)
+
+Back up workloads and persistent data first. This deletes all infrastructure in
+the selected cluster's state, including its VPC, registry instance, and workers;
+it does not delete the shared Terraform state bucket. The separate platform state
+is not cleaned up by this command; review [platform retirement constraints](platform/README.md)
+before deleting a cluster that hosts the Pipelines platform.
+
+```sh copy Copy Destroy Command
+./cluster destroy clusters/lts-2-2.tfvars
+```
+
+The command displays a destruction plan, then requires you to type the selected
+cluster's name before applying that exact plan. A different name or end-of-input
+cancels without applying. It invalidates any previously saved creation/update
+plan for this cluster and removes the temporary destruction plan on exit.
+Persistent storage is not forcibly deleted, and registry data can prevent COS
+deletion; review any remaining resources separately.
+
 ## Create another deployment
 
 For a new cluster in this account, reuse the existing backend setup above; do
@@ -197,8 +216,9 @@ non-overlapping worker, pod, and service ranges, then use `./cluster plan` and
 `./cluster apply` with that file. Review the full plan and budget first.
 The infrastructure Terraform does not install Skupper. Prepare a matching
 platform inputs file and follow the [Pipelines setup guide](platform/README.md)
-for the separate CI platform. Review the release policy, pin a runner image,
-and validate a full run before enabling schedules on another cluster.
+for the separate CI platform. After configuring its release policy, use
+`./platform/manage install <cluster>` to build the runner and validate a full run
+before enabling schedules; no existing runner image or digest is required.
 
 For a different account or a new storage environment, first follow
 [Bootstrap new storage](state-storage/README.md#bootstrap-new-storage).

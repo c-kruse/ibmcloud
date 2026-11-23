@@ -62,7 +62,8 @@ Hat support coverage before relying on it for production.
 
 ## Prerequisites
 
-- Terraform >= 1.10 and < 2, Bash, GNU `realpath`/`sha256sum`, jq, kubectl.
+- Terraform >= 1.10 and < 2, Bash, GNU `realpath`/`sha256sum`/`timeout`, jq, kubectl,
+  and the OpenShift `oc` CLI (for in-cluster builds).
 - Authenticate to the intended cluster as an administrator following the
   [cluster access guide](../README.md#connect-to-a-cluster).
 - Verify `platform/clusters/<cluster>.tfvars` names your authenticated context.
@@ -83,40 +84,63 @@ Terraform variables or commit them in these inputs.
 
 ## Install one cluster (explicitly changes it)
 
-Run from the repository root. Start with development; each apply needs review and
-asks you to type the cluster name. **Do not run these commands merely to inspect
-the installation.**
+Run from the repository root. Start with development:
 
-```sh copy Copy Bootstrap Plan
-./platform/manage bootstrap plan v2-dev
+```sh copy Copy Platform Install
+./platform/manage install v2-dev
 ```
 
-Review the Subscription and selected channel, then apply the saved plan:
+This coordinates the complete installation, without assuming an existing runner
+image or requiring you to edit image digests in Terraform:
 
-```sh copy Copy Bootstrap Apply
-./platform/manage bootstrap apply v2-dev
-./platform/manage bootstrap wait v2-dev
+1. Plan/apply bootstrap and wait for the Operator and Pipeline APIs.
+2. Plan/apply configuration with schedules paused, creating namespaces, accounts,
+   RBAC, storage, BuildConfig, pipelines, and CronJobs.
+3. Refuse an active Skupper PipelineRun, then build the runner in this cluster.
+   Wait for build success, read its exact digest, and verify its ImageStreamImage.
+4. Plan/apply the discovered digest while keeping schedules paused.
+5. Submit the Terraform-rendered Skupper upgrade PipelineRun, preserving the
+   per-task service accounts, and wait for installation and E2E tests to succeed.
+6. Plan/apply again to enable schedules, respecting policy-level suspension.
+
+**Each of the four applies displays its plan and requires the cluster name.**
+Approving the paused configuration also authorizes the subsequent runner build
+and validation run. Do not run `install` merely to inspect an installation.
+The command always builds a runner and validates it, including on reruns; no
+image cache or digest from another cluster is trusted. Build/validation failure
+leaves schedules paused once the paused configuration has been applied. Inspect
+the Build or PipelineRun before rerunning; the installer refuses to proceed if
+it finds an active Skupper run. Builds wait up to 30 minutes; validation waits up
+to 125 minutes for the two-hour PipelineRun.
+
+To leave schedules suspended even after success:
+
+```sh copy Copy Install With Schedules Paused
+TF_VAR_schedules_suspended=true ./platform/manage install v2-dev
 ```
 
-The wait command is read-only and uses no backend credentials. It waits for
-TektonConfig creation/readiness and the Pipeline APIs; it does not install them.
-If installation fails, inspect the Subscription, InstallPlan, and ClusterServiceVersion
-in `openshift-operators` with the explicit context. Do not bypass the readiness gate.
+Repeat with `lts-2-2` after validating development. The two supplied clusters have
+explicit CI release policies; another cluster needs a reviewed policy entry in
+`configuration/pipelines.tf` and support in the install command's policy check.
 
-```sh copy Copy Configuration Plan
-./platform/manage configuration plan v2-dev
-```
+The existing staged `bootstrap`/`configuration` `plan`, `apply`, and `wait`
+commands remain available. A normal configuration plan discovers the runner
+digest from this cluster's Dockerfile-derived ImageStreamTag and verifies the
+ImageStreamImage. If the image is missing, run `install`; `plan` itself never
+starts a build. The digest and temporary schedule override are Terraform input
+variables, not hard-coded per-cluster image pins. Use the same `TF_VAR_*` overrides
+for planning and applying when explicitly supplying them.
 
-Review the singleton import, retention setting, accounts, RBAC, and report PVC:
+Supported inspection commands are `init`, `output`, and `state-list` for either
+stage. For example, `./platform/manage bootstrap state-list v2-dev` reads its state.
+The wait command is read-only and uses no backend credentials. If bootstrap
+fails, inspect the Subscription, InstallPlan, and ClusterServiceVersion in
+`openshift-operators` with the explicit context; do not bypass the readiness gate.
 
-```sh copy Copy Configuration Apply
-./platform/manage configuration apply v2-dev
-./platform/manage configuration wait v2-dev
-```
-
-Repeat the same sequence with `lts-2-2` after validating development. Supported
-inspection commands are `init`, `output`, and `state-list` for either stage.
-For example, `./platform/manage bootstrap state-list v2-dev` reads its state.
+For a recreated cluster, first retire the old platform state deliberately and
+update `platform/clusters/<cluster>.tfvars` to the replacement admin context.
+Installation does not discard remote state, refresh credentials, or restore old
+reports/storage. Keep the shared state bucket and infrastructure state intact.
 
 The wrapper saves plans under `.terraform/platform/<cluster>/<stage>/` and refuses
 to apply if the inputs, stage Terraform files, provider lockfile, backend settings,
@@ -152,9 +176,9 @@ of the old updater. Cadences and suspension are managed in `locals.policies` in
 
 Every successful install/reconcile also runs the full CI subset, even if the
 release has not changed. A scheduler skips if either Skupper pipeline is already
-active; manual races are serialized by the Lease. Set a new cluster policy's
-`schedules_suspended = true` until building the runner and validating a full run;
-an empty runner digest also forces suspension. Enable/suspend via Terraform,
+active; manual races are serialized by the Lease. The installer forces suspension
+until it has built the runner and validated a full run; an empty runner digest
+also forces suspension. Enable/suspend via Terraform,
 not live CronJob edits. These triggers require no external webhook or inbound CI
 access. Tekton Triggers is event-driven, not a clock; Red Hat also documents
 [CronJob-based polling](https://www.redhat.com/en/blog/polling-triggers-in-openshift-pipeline).
@@ -194,22 +218,17 @@ because upstream curl explicitly requests UID 65534. No privileged/anyuid SCC is
 granted. Installer credentials can manage Skupper CRDs/controller RBAC and should
 be treated as highly privileged; scheduler/run-creation rights are trusted too.
 
-### Build and start a run
+### Rebuild and start additional runs
 
-After applying configuration, build the runner **inside the target cluster**:
-
-```sh copy Copy Runner Build
-oc --context v2-dev/dbgg7j4w0ifgskk49eig/admin -n skupper-ci start-build skupper-ci-runner --follow
-```
+Run `./platform/manage install <cluster>` to rebuild the runner, pin its discovered
+digest, and validate the installation before restoring schedules. No manual build
+or digest edits are needed, including after changing the Dockerfile.
 
 The Dockerfile pins base images and direct Python/Ansible collection versions.
 Build output stays in the internal OpenShift registry; no external registry push
-or exposed CI webhook is needed. The BuildConfig has no automatic build triggers.
-After a rebuild, review its output digest and update `local.runner_image` in
-`configuration/pipelines.tf`, then plan/apply configuration before consuming it.
-The content-derived build tag is not the runner's trust boundary: tasks use the
-explicit digest. Update the corresponding policy's `runner_digest`, not the derived
-`runner_image`. A new cluster requires its own build/digest validation. The scripts
+or exposed CI webhook is needed. The BuildConfig has no automatic build triggers;
+the installer starts and waits for the build. The content-derived build tag is
+not the runner's trust boundary: tasks use the discovered explicit digest. The scripts
 are embedded in each PipelineRun's Task specifications, so an in-flight run keeps
 its own code even if Terraform updates the pipeline before its finalizer executes.
 

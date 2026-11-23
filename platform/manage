@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# != 3 || ! $1 =~ ^(bootstrap|configuration)$ || ! $2 =~ ^(init|plan|apply|output|state-list|wait)$ || ! $3 =~ ^[a-z][a-z0-9-]{0,39}$ ]]; then
-  echo "Usage: $0 {bootstrap|configuration} {init|plan|apply|output|state-list|wait} CLUSTER" >&2
+if [[ $# == 2 && $1 == install ]]; then
+  set -- configuration install "$2"
+elif [[ $# != 3 || ! $1 =~ ^(bootstrap|configuration)$ || ! $2 =~ ^(init|plan|apply|output|state-list|wait)$ ]]; then
+  echo "Usage: $0 install CLUSTER | {bootstrap|configuration} {init|plan|apply|output|state-list|wait} CLUSTER" >&2
   exit 2
 fi
 stage=$1 action=$2 cluster=$3
+[[ $cluster =~ ^[a-z][a-z0-9-]{0,39}$ ]] || { echo "Invalid cluster name." >&2; exit 2; }
 root=$(dirname "$(realpath "$0")")
 repo=$(dirname "$root")
 vars="$root/clusters/$cluster.tfvars"
@@ -29,6 +32,86 @@ context=$(jq -er '.context | select(length > 0)' <<< "$settings")
 kubeconfig=$(jq -er .path <<< "$settings")
 kube=(kubectl --kubeconfig "$kubeconfig" --context "$context" --request-timeout=30s)
 
+# Installation reads state itself as well as through child commands, so load
+# credentials in their common parent. Read-only readiness waits need none.
+set +x
+if [[ $action != wait && ( -z ${AWS_ACCESS_KEY_ID:-} || -z ${AWS_SECRET_ACCESS_KEY:-} ) ]]; then
+  credentials=$(ibmcloud resource service-key skupper-tfstate-experiment --output JSON |
+    jq -ec '(if type == "array" then .[0] else . end).credentials.cos_hmac_keys')
+  export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+  AWS_ACCESS_KEY_ID=$(jq -er '.access_key_id | select(length > 0)' <<< "$credentials")
+  AWS_SECRET_ACCESS_KEY=$(jq -er '.secret_access_key | select(length > 0)' <<< "$credentials")
+  unset AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE
+  unset credentials
+fi
+
+if [[ $action == install ]]; then
+  # CI policies are deliberately explicit; do not install an unconfigured track.
+  [[ $cluster == v2-dev || $cluster == lts-2-2 ]] || {
+    echo "Configure a CI release policy for $cluster before installing." >&2; exit 1;
+  }
+  command -v oc >/dev/null
+  command -v timeout >/dev/null
+  cluster_uid=$("${kube[@]}" get namespace kube-system -o jsonpath='{.metadata.uid}')
+  [[ -n $cluster_uid ]] || { echo "Cannot identify target cluster." >&2; exit 1; }
+  printf 'Install platform on %s (%s), context %s\n' "$cluster" "$cluster_uid" "$context"
+  requested_suspension=${TF_VAR_schedules_suspended:-false}
+  export TF_VAR_schedules_suspended=true TF_VAR_runner_digest=""
+  "$0" bootstrap plan "$cluster"
+  "$0" bootstrap apply "$cluster"
+  "$0" bootstrap wait "$cluster"
+  "$0" configuration plan "$cluster"
+  "$0" configuration apply "$cluster"
+  "$0" configuration wait "$cluster"
+
+  # Stop rather than changing the runner beneath an active validation/upgrade.
+  if ! "${kube[@]}" -n skupper-ci get pipelineruns -o json |
+    jq -e '[.items[] | select(.spec.pipelineRef.name == "skupper-upgrade" or .spec.pipelineRef.name == "skupper-test") | select(.status.completionTime == null)] | length == 0' >/dev/null; then
+    echo "A Skupper PipelineRun is active or could not be inspected; schedules remain paused. Check runs and rerun install." >&2
+    exit 1
+  fi
+  oc=(oc --kubeconfig "$kubeconfig" --context "$context" --request-timeout=30m)
+  # Always build in the target cluster. A digest from another cluster is not proof
+  # that this registry contains the image, even when the Dockerfile is unchanged.
+  echo "Building skupper-ci-runner in the target cluster (up to 30 minutes)."
+  if ! build=$(timeout --foreground 30m "${oc[@]}" -n skupper-ci start-build skupper-ci-runner --wait -o name); then
+    echo "Runner build failed or timed out: $build. Inspect builds in skupper-ci; schedules remain paused." >&2
+    exit 1
+  fi
+  TF_VAR_runner_digest=$("${kube[@]}" -n skupper-ci get "$build" -o json |
+    jq -er 'select(.status.phase == "Complete") | .status.output.to.imageDigest | select(test("^sha256:[0-9a-f]{64}$"))')
+  "${kube[@]}" -n skupper-ci get "imagestreamimage/runner@$TF_VAR_runner_digest" -o name
+  printf 'Built runner: %s (%s)\n' "$TF_VAR_runner_digest" "$build"
+  "$0" configuration plan "$cluster"
+  "$0" configuration apply "$cluster"
+
+  # Use Terraform's exact template, including task-specific service accounts.
+  export TF_DATA_DIR="$repo/.terraform/platform/$cluster/configuration"
+  template=$(terraform -chdir="$root/configuration" output -json skupper_manual_runs |
+    jq -e '.upgrade')
+  run=$("${kube[@]}" create -f - -o name <<< "$template")
+  printf 'Validating installation with %s\n' "$run"
+  deadline=$((SECONDS + 7500))
+  while (( SECONDS < deadline )); do
+    result=$("${kube[@]}" -n skupper-ci get "$run" -o json |
+      jq -r '[.status.conditions[]? | select(.type == "Succeeded") | .status][0] // "Unknown"')
+    case "$result" in
+      True) break ;;
+      False) echo "Installation validation failed: $run. Schedules remain paused." >&2; exit 1 ;;
+    esac
+    sleep 5
+  done
+  [[ $result == True ]] || { echo "Timed out waiting for $run; schedules remain paused." >&2; exit 1; }
+  [[ $("${kube[@]}" get namespace kube-system -o jsonpath='{.metadata.uid}') == "$cluster_uid" ]] || {
+    echo "Cluster identity changed during installation; schedules remain paused." >&2; exit 1;
+  }
+  TF_VAR_schedules_suspended=$requested_suspension
+  "$0" configuration plan "$cluster"
+  "$0" configuration apply "$cluster"
+  echo "Platform installed and validated on $cluster."
+  exit
+fi
+
 if [[ $action == wait ]]; then
   "${kube[@]}" wait --for=create crd/tektonconfigs.operator.tekton.dev --timeout=10m
   "${kube[@]}" wait --for=condition=Established crd/tektonconfigs.operator.tekton.dev --timeout=10m
@@ -45,17 +128,6 @@ if [[ $action == plan ]]; then
   rm -f "$plan" "$plan.sha256"
 fi
 
-set +x
-if [[ -z ${AWS_ACCESS_KEY_ID:-} || -z ${AWS_SECRET_ACCESS_KEY:-} ]]; then
-  credentials=$(ibmcloud resource service-key skupper-tfstate-experiment --output JSON |
-    jq -ec '(if type == "array" then .[0] else . end).credentials.cos_hmac_keys')
-  export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-  AWS_ACCESS_KEY_ID=$(jq -er '.access_key_id | select(length > 0)' <<< "$credentials")
-  AWS_SECRET_ACCESS_KEY=$(jq -er '.secret_access_key | select(length > 0)' <<< "$credentials")
-  unset AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE
-  unset credentials
-fi
-
 key="platform/v1.0/$cluster/$stage.tfstate"
 printf 'Cluster: %s\nContext: %s\nStage: %s\nState key: %s\n' "$cluster" "$context" "$stage" "$key"
 terraform -chdir="$root/$stage" init -input=false -reconfigure \
@@ -68,6 +140,7 @@ fingerprint() {
     cat "$vars" "$repo/backend.hcl" "$root/$stage/"*.tf "$root/$stage/.terraform.lock.hcl" || return
     if [[ $stage == configuration ]]; then
       sha256sum "$root/$stage/Dockerfile" "$root/$stage/scripts/"*.py || return
+      printf '%s\n' "${TF_VAR_runner_digest-unset}" "${TF_VAR_schedules_suspended-unset}"
     fi
     "${kube[@]}" get namespace kube-system -o jsonpath='{.metadata.uid}'
   } | sha256sum
@@ -79,6 +152,19 @@ case "$action" in
     digest=$(fingerprint)
     if [[ $stage == configuration ]]; then
       "${kube[@]}" wait --for=condition=Ready tektonconfig/config --timeout=30s
+      if [[ ! ${TF_VAR_runner_digest+x} ]]; then
+        runner_tag=$(sha256sum "$root/configuration/Dockerfile")
+        runner_tag=${runner_tag:0:16}
+        if ! TF_VAR_runner_digest=$("${kube[@]}" -n skupper-ci get "imagestreamtag/runner:$runner_tag" -o json |
+          jq -er '.image.metadata.name | select(test("^sha256:[0-9a-f]{64}$"))'); then
+          echo "No runner image for these build inputs. Run '$0 install $cluster' first." >&2
+          exit 1
+        fi
+        export TF_VAR_runner_digest
+      fi
+      if [[ -n $TF_VAR_runner_digest ]]; then
+        "${kube[@]}" -n skupper-ci get "imagestreamimage/runner@$TF_VAR_runner_digest" -o name
+      fi
     fi
     terraform -chdir="$root/$stage" plan -input=false -var-file="$vars" -out="$plan"
     printf '%s\n' "$digest" > "$plan.sha256"

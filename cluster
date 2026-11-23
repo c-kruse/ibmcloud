@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# != 2 ]] || [[ ! $1 =~ ^(init|plan|apply|output|state-list)$ ]]; then
-  echo "Usage: $0 {init|plan|apply|output|state-list} <cluster.tfvars>" >&2
+if [[ $# != 2 ]] || [[ ! $1 =~ ^(init|plan|apply|destroy|output|state-list)$ ]]; then
+  echo "Usage: $0 {init|plan|apply|destroy|output|state-list} <cluster.tfvars>" >&2
   exit 2
 fi
 
@@ -18,7 +18,7 @@ root=$(dirname "$(realpath "$0")")
 # Credentials stay in this process, never printed or written to a config file.
 # Explicit provider API keys and complete HMAC credentials still work for CI.
 set +x
-if [[ $action =~ ^(plan|apply)$ && -z ${IBMCLOUD_API_KEY:-}${IC_API_KEY:-} ]]; then
+if [[ $action =~ ^(plan|apply|destroy)$ && -z ${IBMCLOUD_API_KEY:-}${IC_API_KEY:-} ]]; then
   if ! iam_token=$(ibmcloud iam oauth-tokens --output JSON | jq -er '.iam_token | select(type == "string" and length > 0)'); then
     echo "IBM Cloud login unavailable. Run 'ibmcloud login --sso' and retry." >&2
     exit 1
@@ -83,6 +83,17 @@ case "$action" in
     [[ $answer == "$cluster_name" ]] || { echo "Cancelled." >&2; exit 1; }
     terraform -chdir="$root" apply -input=false "$plan"
     rm -f "$plan" "$plan.inputs.sha256"
+    ;;
+  destroy)
+    # Invalidate any creation/update plan before planning destruction.
+    rm -f "$plan" "$plan.inputs.sha256"
+    destroy_plan="$TF_DATA_DIR/destroy.tfplan"
+    trap 'rm -rf "$scratch"; rm -f "$destroy_plan"' EXIT
+    terraform -chdir="$root" plan -destroy -input=false -var-file="$vars" \
+      -var="cluster_name=$cluster_name" -out="$destroy_plan"
+    read -r -p "Destroy this cluster and its managed infrastructure? Type $cluster_name to confirm: " answer
+    [[ $answer == "$cluster_name" ]] || { echo "Cancelled." >&2; exit 1; }
+    terraform -chdir="$root" apply -input=false "$destroy_plan"
     ;;
   output) terraform -chdir="$root" output ;;
   state-list) terraform -chdir="$root" state list ;;
